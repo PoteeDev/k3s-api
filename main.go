@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"text/template"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -44,15 +45,7 @@ type K8sApi struct {
 }
 
 func GetConfig(task string) string {
-	// Note: YOUR-ACCESSKEYID, YOUR-SECRETACCESSKEY, my-bucketname, my-objectname
-	// and my-filename.csv are dummy values, please replace them with original values.
-
-	// Requests are always secure (HTTPS) by default. Set secure=false to enable insecure (HTTP) access.
-	// This boolean value is the last argument for New().
-
-	// New returns an Amazon S3 compatible client object. API compatibility (v2 or v4) is automatically
-	// determined based on the Endpoint value.
-	s3Client, err := minio.New("minio:9000", &minio.Options{
+	s3Client, err := minio.New(fmt.Sprintf("%s:9000", os.Getenv("MINIO_HOST")), &minio.Options{
 		Creds:  credentials.NewStaticV4(os.Getenv("MINIO_ACCESS_KEY"), os.Getenv("MINIO_SECRET_KEY"), ""),
 		Secure: false,
 	})
@@ -215,6 +208,14 @@ func (h *Handlers) Run(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(&Response{err.Error()})
 		return
 	}
+	podName := fmt.Sprintf("%s-%s", req.TaskName, req.ClientName)
+	destroyFunc := func() {
+		err = h.api.DeleteManifest(manifest, pvars)
+		if err != nil {
+			log.Printf("destroy pod %s for error: %v", podName, err)
+		}
+	}
+	podsTimer.CreatePodTimer(podName, destroyFunc)
 	resp := Response{"ok"}
 	json.NewEncoder(w).Encode(resp)
 }
@@ -236,28 +237,37 @@ func (h *Handlers) Stop(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(&Response{err.Error()})
 		return
 	}
+	podsTimer.StopPodTimer(fmt.Sprintf("%s-%s", req.TaskName, req.ClientName))
 	resp := Response{"ok"}
 	json.NewEncoder(w).Encode(&resp)
+}
+
+type StatusRespone struct {
+	Name      string `json:"name"`
+	Phase     string `json:"phase"`
+	IP        string `json:"ip"`
+	CreatedAt string `json:"created_at"`
 }
 
 func (h *Handlers) Active(w http.ResponseWriter, r *http.Request) {
 	var req Request
 	json.NewDecoder(r.Body).Decode(&req)
-	selector := fmt.Sprintf("client=%s", req.ClientName)
+	var selector string
+	if req.TaskName == "" {
+		selector = fmt.Sprintf("client=%s", req.ClientName)
+	} else {
+		selector = fmt.Sprintf("app=%s-%s", req.TaskName, req.ClientName)
+	}
+
 	pods, _ := h.api.Clientset.CoreV1().Pods("potee").List(context.TODO(),
 		metav1.ListOptions{LabelSelector: selector})
 
 	for _, pod := range pods.Items {
-		json.NewEncoder(w).Encode(&Response{pod.Name})
+		resp := StatusRespone{pod.Name, string(pod.Status.Phase), pod.Status.PodIP, pod.CreationTimestamp.Format("15:04")}
+		json.NewEncoder(w).Encode(&resp)
 		return
 	}
-	json.NewEncoder(w).Encode(&Response{""})
-}
-
-type StatusRespone struct {
-	Phase     string `json:"phase"`
-	IP        string `json:"ip"`
-	CreatedAt string `json:"created_at"`
+	json.NewEncoder(w).Encode(&StatusRespone{"", "", "", ""})
 }
 
 func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
@@ -268,7 +278,7 @@ func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
 		metav1.ListOptions{LabelSelector: selector})
 
 	for _, pod := range pods.Items {
-		resp := StatusRespone{string(pod.Status.Phase), pod.Status.PodIP, pod.CreationTimestamp.Format("15:04")}
+		resp := StatusRespone{pod.Name, string(pod.Status.Phase), pod.Status.PodIP, pod.CreationTimestamp.Format("15:04")}
 
 		json.NewEncoder(w).Encode(&resp)
 		return
@@ -276,7 +286,20 @@ func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
 
 }
 
+type RequestLogger struct {
+	h http.Handler
+	l *log.Logger
+}
+
+func (rl RequestLogger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	// rl.l.Printf("Started %s %s", r.Method, r.URL.Path)
+	rl.h.ServeHTTP(w, r)
+	rl.l.Printf("- %v - %s %s in %v", start.Format("2006-01-02T15:04:05Z07:00"), r.Method, r.URL.Path, time.Since(start))
+}
+
 func Router() *http.ServeMux {
+
 	h := Handlers{api: InitK8sApi(kubeconfig)}
 	mux := http.NewServeMux()
 	runHandler := http.HandlerFunc(h.Run)
@@ -291,15 +314,18 @@ func Router() *http.ServeMux {
 	statusHandler := http.HandlerFunc(h.Status)
 	mux.Handle("/status", Auth(statusHandler))
 
-	log.Print("Listening...")
 	return mux
 }
+
+var podsTimer = InitTimer()
 
 func main() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "")
 	flag.StringVar(&filename, "f", "", "")
 	flag.StringVar(&command, "c", "", "")
 	flag.Parse()
-	log.Fatalln(http.ListenAndServe(":3000", Router()))
+	l := log.New(os.Stdout, "app ", 0)
+	log.Print("Listening...")
+	log.Fatalln(http.ListenAndServe(":3000", RequestLogger{Router(), l}))
 
 }
